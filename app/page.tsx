@@ -49,7 +49,7 @@ export default function FlowAnimation() {
     const LEFT_RELEASE_SPEED = 0.9;
     const LEFT_CHAMBER_DRIFT = 0.15; // Increased gravity
     const BEFORE_REFILL_INTERVAL = 500;
-    const INITIAL_BEFORE_COUNT = 340; // enough mass to pack the chamber from gate to rim
+    const INITIAL_BEFORE_COUNT = 280; // enough mass to pack the chamber without over-compressing the neck
     const TOP_FILL_OFFSET = -28; // negative pushes the pile crest above the rim for an overfilled look
     const SURFACE_DIP = 28; // shallower dip so the crest stays high across most of the width
 
