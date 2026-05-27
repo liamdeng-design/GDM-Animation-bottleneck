@@ -45,13 +45,17 @@ export default function FlowAnimation() {
     };
 
     // ---------- left side behavior ----------
-    const LEFT_RELEASE_INTERVAL = 1100;
+    const LEFT_RELEASE_INTERVAL = 900;
     const LEFT_RELEASE_SPEED = 0.9;
     const LEFT_CHAMBER_DRIFT = 0.15; // Increased gravity
-    const BEFORE_REFILL_INTERVAL = 600;
-    const INITIAL_BEFORE_COUNT = 180; // Significantly more balls for a solid mass
-    const TOP_FILL_OFFSET = 25;
-    const SURFACE_DIP = 45; // more curve
+    const BEFORE_REFILL_INTERVAL = 500;
+    const INITIAL_BEFORE_COUNT = 340; // enough mass to pack the chamber from gate to rim
+    const TOP_FILL_OFFSET = -28; // negative pushes the pile crest above the rim for an overfilled look
+    const SURFACE_DIP = 28; // shallower dip so the crest stays high across most of the width
+
+    // ---------- overflow / leakage ----------
+    const OVERFLOW_BURST_INTERVAL = 550;
+    const OVERFLOW_GRAVITY = 0.08;
 
     // ---------- right side behavior ----------
     const AFTER_FLOW_SPEED = 0.85;
@@ -61,9 +65,11 @@ export default function FlowAnimation() {
     // ---------- global state ----------
     const state = {
       beforeParticles: [] as any[],
+      leakedParticles: [] as any[],
       afterParticles: [] as any[],
       lastTubeRelease: 0,
       lastBeforeRefill: 0,
+      lastOverflowBurst: 0,
       lastAfterSpawnByLane: Array(AFTER_LANES).fill(0),
       laneIndex: 0,
       beforeRefillQueue: 0,
@@ -372,6 +378,43 @@ export default function FlowAnimation() {
       state.beforeParticles = remaining;
     }
 
+    // ---------- overflow / leakage ----------
+    function spawnLeakedBurst(layout: any) {
+      const f = layout.funnel;
+      const side = Math.random() < 0.5 ? -1 : 1;
+      const rimX = f.cx + side * (f.topWidth / 2);
+      const count = 1 + Math.floor(Math.random() * 3); // 1-3 per burst
+
+      for (let i = 0; i < count; i++) {
+        state.leakedParticles.push({
+          x: rimX + side * rand(-1, 5),
+          y: f.topY + rand(-6, 8),
+          r: BALL_R * rand(0.75, 1.0),
+          vx: side * rand(0.45, 1.1),
+          vy: rand(-0.15, 0.25),
+          alpha: rand(0.85, 1.0),
+          fadeRate: rand(0.006, 0.011)
+        });
+      }
+    }
+
+    function updateLeaked(layout: any, now: number) {
+      const jitter = rand(-100, 100);
+      if (now - state.lastOverflowBurst > OVERFLOW_BURST_INTERVAL + jitter) {
+        spawnLeakedBurst(layout);
+        state.lastOverflowBurst = now;
+      }
+
+      for (const p of state.leakedParticles) {
+        p.vy += OVERFLOW_GRAVITY;
+        p.x += p.vx;
+        p.y += p.vy;
+        p.alpha -= p.fadeRate;
+      }
+
+      state.leakedParticles = state.leakedParticles.filter(p => p.alpha > 0);
+    }
+
     // ---------- before collisions ----------
     function resolveBeforeCollisions(layout: any) {
       const particles = state.beforeParticles;
@@ -533,6 +576,11 @@ export default function FlowAnimation() {
       }
 
       drawFunnelOutline(ctx, f);
+
+      // Leaked particles drawn on top of the rim so the spill reads as outside the funnel
+      for (const p of state.leakedParticles) {
+        drawBall(ctx, p.x, p.y, p.r, COLORS.problem, p.alpha);
+      }
       ctx.restore();
     }
 
@@ -569,6 +617,7 @@ export default function FlowAnimation() {
       }
 
       updateBefore(layout, now);
+      updateLeaked(layout, now);
       updateAfter(layout, now);
 
       // Always draw background effects for visual consistency and "clarity"
