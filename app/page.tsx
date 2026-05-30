@@ -8,13 +8,25 @@ export default function FlowAnimation() {
   const [isExporting, setIsExporting] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
 
-  // Refs for recording access
+  // Recording target: 24fps × 12 seconds = 288 frames of real animation, played back
+  // at 24fps for a 12-second real-time GIF (no slow-mo).
+  const TARGET_FPS = 24;
+  const TARGET_DURATION_S = 12;
+  const CAPTURE_INTERVAL_MS = 1000 / TARGET_FPS;
+  const MAX_FRAMES = TARGET_FPS * TARGET_DURATION_S;
+
+  // Frames are stored as lossless PNG data URIs. At 288 frames raw RGBA would be
+  // ~1.7 GB and would crash the tab; PNGs compress the mostly-black background
+  // very efficiently (~150 KB / frame, ~45 MB total).
   const recordStateRef = useRef({
     isRecording: false,
     recordingType: null as 'left' | 'right' | null,
     frames: [] as string[],
     frameCount: 0,
-    maxFrames: 60, // ~3 seconds at 20fps for a clean loop
+    maxFrames: MAX_FRAMES,
+    gifWidth: 0,
+    gifHeight: 0,
+    lastCaptureTime: 0,
   });
 
   useEffect(() => {
@@ -45,17 +57,14 @@ export default function FlowAnimation() {
     };
 
     // ---------- left side behavior ----------
-    const LEFT_RELEASE_INTERVAL = 900;
-    const LEFT_RELEASE_SPEED = 0.9;
+    const LEFT_RELEASE_INTERVAL = 1500; // bottleneck is now tighter — fewer balls drain through the neck
+    const LEFT_RELEASE_SPEED = 0.55;    // and the ones that do trickle through fall slower
     const LEFT_CHAMBER_DRIFT = 0.15; // Increased gravity
-    const BEFORE_REFILL_INTERVAL = 500;
-    const INITIAL_BEFORE_COUNT = 280; // enough mass to pack the chamber without over-compressing the neck
-    const TOP_FILL_OFFSET = -28; // negative pushes the pile crest above the rim for an overfilled look
-    const SURFACE_DIP = 28; // shallower dip so the crest stays high across most of the width
-
-    // ---------- overflow / leakage ----------
-    const OVERFLOW_BURST_INTERVAL = 550;
-    const OVERFLOW_GRAVITY = 0.08;
+    const BEFORE_REFILL_INTERVAL = 240;
+    const INITIAL_BEFORE_COUNT = 450; // enough mass for the mound to peak above the rim and spill
+    const MOUND_HEIGHT = 50;          // how far above the rim the center of the granular pile peaks
+    const LEAK_GRAVITY = 0.12;        // gravity applied to balls that have escaped the bowl
+    const LEAK_LIFETIME = 54;         // frames a leaked ball lives before fully fading (~0.9s at 60fps)
 
     // ---------- right side behavior ----------
     const AFTER_FLOW_SPEED = 0.85;
@@ -65,16 +74,15 @@ export default function FlowAnimation() {
     // ---------- global state ----------
     const state = {
       beforeParticles: [] as any[],
-      leakedParticles: [] as any[],
       afterParticles: [] as any[],
       lastTubeRelease: 0,
       lastBeforeRefill: 0,
-      lastOverflowBurst: 0,
       lastAfterSpawnByLane: Array(AFTER_LANES).fill(0),
       laneIndex: 0,
       beforeRefillQueue: 0,
       seededBefore: false,
-      seededAfter: false
+      seededAfter: false,
+      seeding: false  // true while seedBeforeParticles is running — used to suppress leak-marking
     };
 
     function resize() {
@@ -174,11 +182,23 @@ export default function FlowAnimation() {
       };
     }
 
-    function drawFunnelOutline(ctx: CanvasRenderingContext2D, f: any) {
+    // Modes: 'full' draws the whole outline. 'back' draws only the back half of the top
+    // rim ellipse (so balls above the rim can be drawn over it for depth). 'front' draws
+    // the side walls, the front half of the top rim, and the bottom rim.
+    function drawFunnelOutline(ctx: CanvasRenderingContext2D, f: any, mode: 'full' | 'back' | 'front' = 'full') {
       ctx.strokeStyle = COLORS.line;
-      ctx.lineWidth = 1.0; 
-      
-      // Left curve
+      ctx.lineWidth = 1.0;
+
+      if (mode === 'back') {
+        // Back arc of the top rim only — the half farther from the viewer (upper half of the ellipse).
+        // Drawn first so balls cresting above the rim occlude it correctly.
+        ctx.beginPath();
+        ctx.ellipse(f.cx, f.topY, f.topWidth / 2, 7, 0, Math.PI, 2 * Math.PI);
+        ctx.stroke();
+        return;
+      }
+
+      // 'front' and 'full' both draw the side walls.
       ctx.beginPath();
       for (let y = f.topY; y <= f.bottomY; y += 2) {
         const r = getFunnelRadius(f, y);
@@ -187,7 +207,6 @@ export default function FlowAnimation() {
       }
       ctx.stroke();
 
-      // Right curve
       ctx.beginPath();
       for (let y = f.topY; y <= f.bottomY; y += 2) {
         const r = getFunnelRadius(f, y);
@@ -196,11 +215,19 @@ export default function FlowAnimation() {
       }
       ctx.stroke();
 
-      // Rims - Using full ellipses (360 degrees) to show complete circles at entrances and exits
-      ctx.beginPath();
-      ctx.ellipse(f.cx, f.topY, f.topWidth / 2, 7, 0, 0, Math.PI * 2);
-      ctx.stroke();
+      if (mode === 'front') {
+        // Front arc only — the half closer to the viewer (lower half of the ellipse).
+        ctx.beginPath();
+        ctx.ellipse(f.cx, f.topY, f.topWidth / 2, 7, 0, 0, Math.PI);
+        ctx.stroke();
+      } else {
+        // 'full' — whole top-rim ellipse.
+        ctx.beginPath();
+        ctx.ellipse(f.cx, f.topY, f.topWidth / 2, 7, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
 
+      // Bottom rim — always drawn full (small, at the exit of the tube).
       ctx.beginPath();
       ctx.ellipse(f.cx, f.bottomY, f.bottomWidth / 2, 3, 0, 0, Math.PI * 2);
       ctx.stroke();
@@ -208,8 +235,11 @@ export default function FlowAnimation() {
 
     // ---------- curved surface ----------
     function getBeforeSurfaceY(f: any, x: number) {
-      const t = Math.abs((x - f.cx) / (f.topWidth * 0.5));
-      return f.topY + TOP_FILL_OFFSET + SURFACE_DIP * (1 - t * t);
+      // Granular mound: peak in the center sits MOUND_HEIGHT above the rim and tapers
+      // to rim level at the bowl walls. Beyond the walls (t>1) we clamp to t=1 so the
+      // formula stays well-defined; leaked balls bypass this constraint anyway.
+      const t = Math.min(1, Math.abs((x - f.cx) / (f.topWidth * 0.5)));
+      return f.topY - MOUND_HEIGHT * (1 - t * t);
     }
 
     // ---------- before seed ----------
@@ -253,10 +283,20 @@ export default function FlowAnimation() {
         });
       }
 
-      for (let k = 0; k < 200; k++) { // Further increased iterations for a rock-solid initial state
+      // Pre-settle: apply a gravity step every iteration so particles actually fall
+      // and pack densely from the gate upward, instead of staying at their random spawn y.
+      // We mark `state.seeding = true` so the constraint doesn't leak balls during this
+      // packing phase — otherwise edge balls would be marked leaked from collisions and
+      // the chamber would start under-filled.
+      state.seeding = true;
+      for (let k = 0; k < 260; k++) {
+        for (const p of state.beforeParticles) {
+          if (!p.released) p.y += 1.2;
+        }
         resolveBeforeCollisions(layout);
         constrainBeforeParticles(layout);
       }
+      state.seeding = false;
 
       state.seededBefore = true;
     }
@@ -291,17 +331,20 @@ export default function FlowAnimation() {
     // ---------- before refill ----------
     function spawnBeforeRefill(layout: any) {
       const f = layout.funnel;
-      const x = rand(f.cx - f.topWidth / 2 + BALL_R + 15, f.cx + f.topWidth / 2 - BALL_R - 15);
+      // Drop refills near the center — like pouring grain on top of a pile, so the
+      // mound is fed at its peak and the mass redistributes outward via collisions.
+      // Varied x and y so balls in flight don't all overlap into one stream.
+      const x = f.cx + rand(-38, 38);
 
       state.beforeParticles.push({
         x,
-        y: f.topY - rand(20, 40),
+        y: f.topY - MOUND_HEIGHT - rand(40, 110), // start well above the mound so balls are airborne for a while
         r: BALL_R,
-        vx: rand(-0.02, 0.02),
-        vy: rand(0.3, 0.6),
+        vx: rand(-0.04, 0.04),
+        vy: rand(0.2, 0.55),
         released: false,
         fallingIn: true,
-        alpha: 1.0 // Start fully opaque to prevent "ghost" particles
+        alpha: 1.0
       });
     }
 
@@ -334,27 +377,70 @@ export default function FlowAnimation() {
         }
       }
 
-      if (state.beforeRefillQueue > 0 && now - state.lastBeforeRefill > BEFORE_REFILL_INTERVAL) {
+      // Spawn refills on a steady schedule, regardless of queue. Excess mass naturally
+      // leaves via the bottleneck or by overflowing the rim, so the chamber self-balances.
+      // This is what gives the "constant rain from above" look the user wants.
+      if (now - state.lastBeforeRefill > BEFORE_REFILL_INTERVAL) {
         spawnBeforeRefill(layout);
-        state.beforeRefillQueue -= 1;
+        if (state.beforeRefillQueue > 0) state.beforeRefillQueue -= 1;
         state.lastBeforeRefill = now;
       }
 
       for (const p of state.beforeParticles) {
-        // Safety: Ensure every active particle is fully opaque
-        p.alpha = 1.0;
+        if (p.leaked) {
+          // Escaped the bowl: gravity dominates. Horizontal motion is damped
+          // aggressively so the ball doesn't sail outward — after clearing the rim
+          // it should fall almost straight down, the way a real grain would.
+          p.vy += LEAK_GRAVITY * (p.leakGFactor ?? 1);
+          p.vx *= 0.94;   // strong horizontal damping — kills outward drift within ~12 frames
+          p.vy *= 0.998;  // very gentle vertical damping so gravity wins
 
-        if (p.released) {
+          p.leakAge = (p.leakAge ?? 0) + 1;
+          const t = Math.min(1, p.leakAge / LEAK_LIFETIME);
+          p.alpha = Math.max(0, 1 - t * t);
+          p.r = BALL_R * (1 - 0.25 * t);
+        } else if (p.released) {
+          p.alpha = 1.0;
           p.vy = lerp(p.vy, LEFT_RELEASE_SPEED, 0.1);
           p.vx = 0;
+        } else if (p.fallingIn) {
+          p.alpha = 1.0;
+          p.vy += 0.06; // refill drops in from above
         } else {
-          if (p.fallingIn) {
-            p.vy += 0.05; // Faster falling
-          } else {
-            // Apply strong downward pressure and horizontal vibration
-            p.vy = lerp(p.vy, LEFT_CHAMBER_DRIFT + 0.5, 0.2); 
-            p.vx *= 0.95; // Reduced damping to allow for better settling
-            p.vx += rand(-0.04, 0.04); // Increased vibration to break up jams
+          p.alpha = 1.0;
+          // Granular flow: depth determines liveliness.
+          //   - top of pile (depth ~ 0): full gravity, light damping, lateral noise — looks alive.
+          //   - bottom of pile (depth ~ 1): weight is supported by the balls above, so we
+          //     scale gravity DOWN (the ball below it is holding it up) AND damp HARD
+          //     (relative motion dies in 2–3 frames). Together they kill the residual
+          //     "elastic jitter" from collision-only solvers.
+          const surfaceY = getBeforeSurfaceY(f, p.x);
+          const depthRange = Math.max(gateY - surfaceY, 1);
+          const depth = clamp((p.y - surfaceY) / depthRange, 0, 1);
+
+          const gravity = lerp(0.06, 0.012, depth); // bottom: almost no net gravity (supported)
+          const dampY = lerp(0.96, 0.30, depth);    // bottom: vy *= 0.3 each frame -> motion vanishes
+          const dampX = lerp(0.94, 0.22, depth);    // top keeps lateral motion long enough to spill
+
+          p.vy += gravity;
+          p.vy *= dampY;
+          p.vx *= dampX;
+
+          // Near the crest of the mound the surface is "alive": a small random jitter and,
+          // critically, a CONTINUOUS directional outward push for balls near the rim wall.
+          // This is the granular-physics analog of grains rolling down the slope of a heap
+          // and tipping over the edge of the bowl. Without it the system is symmetric and
+          // balls would never reliably reach the rim corner — overflow would stall.
+          if (depth < 0.35) {
+            p.vx += rand(-0.015, 0.015);
+            const distFromCenter = Math.abs(p.x - f.cx);
+            const nearWall = distFromCenter > f.topWidth / 2 - 70;
+            if (nearWall) {
+              const outwardSign = p.x > f.cx ? 1 : -1;
+              // Push grows the closer the ball is to the wall — like grains rolling off a slope.
+              const wallProximity = (distFromCenter - (f.topWidth / 2 - 70)) / 70; // 0 at 70px from wall, 1 at wall
+              p.vx += outwardSign * (0.05 + 0.06 * wallProximity);
+            }
           }
         }
 
@@ -369,50 +455,19 @@ export default function FlowAnimation() {
 
       const remaining = [];
       for (const p of state.beforeParticles) {
-        if (p.y > f.bottomY + 18) {
+        // Drained through the neck
+        if (p.y > f.bottomY + 18 && !p.leaked) {
           state.beforeRefillQueue += 1;
-        } else {
-          remaining.push(p);
+          continue;
         }
+        // Spilled over the rim and either faded out or fell off-screen
+        if (p.leaked && (p.alpha <= 0 || p.y > f.bottomY + 80)) {
+          state.beforeRefillQueue += 1;
+          continue;
+        }
+        remaining.push(p);
       }
       state.beforeParticles = remaining;
-    }
-
-    // ---------- overflow / leakage ----------
-    function spawnLeakedBurst(layout: any) {
-      const f = layout.funnel;
-      const side = Math.random() < 0.5 ? -1 : 1;
-      const rimX = f.cx + side * (f.topWidth / 2);
-      const count = 1 + Math.floor(Math.random() * 3); // 1-3 per burst
-
-      for (let i = 0; i < count; i++) {
-        state.leakedParticles.push({
-          x: rimX + side * rand(-1, 5),
-          y: f.topY + rand(-6, 8),
-          r: BALL_R * rand(0.75, 1.0),
-          vx: side * rand(0.45, 1.1),
-          vy: rand(-0.15, 0.25),
-          alpha: rand(0.85, 1.0),
-          fadeRate: rand(0.006, 0.011)
-        });
-      }
-    }
-
-    function updateLeaked(layout: any, now: number) {
-      const jitter = rand(-100, 100);
-      if (now - state.lastOverflowBurst > OVERFLOW_BURST_INTERVAL + jitter) {
-        spawnLeakedBurst(layout);
-        state.lastOverflowBurst = now;
-      }
-
-      for (const p of state.leakedParticles) {
-        p.vy += OVERFLOW_GRAVITY;
-        p.x += p.vx;
-        p.y += p.vy;
-        p.alpha -= p.fadeRate;
-      }
-
-      state.leakedParticles = state.leakedParticles.filter(p => p.alpha > 0);
     }
 
     // ---------- before collisions ----------
@@ -425,9 +480,12 @@ export default function FlowAnimation() {
           const a = particles[i];
           const b = particles[j];
 
+          // Spilled balls have left the chamber — they don't collide with the pile any more.
+          if (a.leaked || b.leaked) continue;
+
           const dx = b.x - a.x;
           const dy = b.y - a.y;
-          const minDist = a.r + b.r + 0.05; // Reduced margin for tighter packing
+          const minDist = a.r + b.r + 0.05;
           const d2 = dx * dx + dy * dy;
 
           if (d2 < minDist * minDist) {
@@ -442,10 +500,24 @@ export default function FlowAnimation() {
             const wA = aFixed ? 0 : (bFixed ? 1 : 0.5);
             const wB = bFixed ? 0 : (aFixed ? 1 : 0.5);
 
+            // Position correction — push overlapping balls apart along the normal.
             a.x -= nx * overlap * wA;
             a.y -= ny * overlap * wA;
             b.x += nx * overlap * wB;
             b.y += ny * overlap * wB;
+
+            // Inelastic contact damping — kill any approaching relative velocity along
+            // the collision normal. Without this, balls in a pressed pile keep gaining
+            // velocity from gravity each frame and the collision-vs-constraint cycle
+            // makes the bottom look bouncy. This makes contacts behave like grains of
+            // sand (no rebound), which is what the user wants.
+            const rvn = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+            if (rvn < 0) {
+              a.vx += rvn * nx * wA;
+              a.vy += rvn * ny * wA;
+              b.vx -= rvn * nx * wB;
+              b.vy -= rvn * ny * wB;
+            }
           }
         }
       }
@@ -457,9 +529,35 @@ export default function FlowAnimation() {
       const gateY = f.neckY - 50;
 
       for (const p of state.beforeParticles) {
-        if (!p.released) {
+        if (p.leaked) continue;
+
+        const distFromCenter = Math.abs(p.x - f.cx);
+
+        // STEP 1: Leak detection runs FIRST. If a non-released ball has drifted past the
+        // rim corner near rim height, mark it leaked immediately — before the wall clamp
+        // gets a chance to pull it back. (That was the bug: wall clamp ran first, x was
+        // clamped back inside, and the leak condition could never fire.)
+        // Skipped during seed so we don't drain the chamber while pre-packing it.
+        if (!state.seeding && !p.released && distFromCenter > f.topWidth / 2 && p.y < f.topY + p.r * 2.2) {
+          p.leaked = true;
+          p.leakAge = 0;
+          const side = p.x > f.cx ? 1 : -1;
+          // Per-ball variation, but keep horizontal velocity small — the ball has just
+          // tipped over the rim, gravity should dominate, not horizontal momentum.
+          //   - vx: small outward kick, only a fraction of the inherited chamber velocity.
+          //   - vy: tiny variation around 0 — no big upward pop, gravity takes it from there.
+          p.vx = p.vx * rand(0.10, 0.35) + side * rand(0.08, 0.30);
+          p.vy = p.vy * rand(0.2, 0.6) + rand(-0.2, 0.25);
+          p.leakGFactor = rand(0.85, 1.15);
+          continue;
+        }
+
+        const insideBowlH = distFromCenter < f.topWidth / 2;
+
+        if (!p.released && insideBowlH) {
+          // Mound ceiling applies only when the ball is still inside the bowl horizontally.
           const surfaceY = getBeforeSurfaceY(f, p.x);
-          
+
           if (p.fallingIn) {
             if (p.y >= surfaceY) {
               p.fallingIn = false;
@@ -476,17 +574,26 @@ export default function FlowAnimation() {
 
         if (!p.released && p.y > gateY) {
           p.y = gateY;
+          p.vy = 0;
         }
 
         if (p.released) {
-          // Snap particle exactly to center output line gracefully
           p.x = lerp(p.x, f.cx, 0.3);
           continue;
         }
 
-        const sampleY = Math.min(p.y, gateY);
-        const b = funnelBoundsAtY(f, sampleY, p.r + 0.5);
-        p.x = clamp(p.x, b.leftBound, b.rightBound);
+        // STEP 2: Wall clamp — only when clearly below the rim. We leave a transit zone
+        // of ~p.r/2 around the rim line so a ball drifting outward at the crest can
+        // actually reach the leak threshold above instead of being immediately yanked back.
+        if (p.y > f.topY + p.r * 0.5) {
+          const sampleY = Math.min(p.y, gateY);
+          const b = funnelBoundsAtY(f, sampleY, p.r + 0.5);
+          const beforeX = p.x;
+          p.x = clamp(p.x, b.leftBound, b.rightBound);
+          if (p.x !== beforeX) {
+            p.vx = 0;
+          }
+        }
       }
     }
 
@@ -571,14 +678,24 @@ export default function FlowAnimation() {
       const f = layout.funnel;
 
       ctx.save();
+
+      // Depth pass 1: BACK arc of the rim. Anything drawn after this with overlap
+      // (the mound balls above the rim line) will correctly cover it.
+      drawFunnelOutline(ctx, f, 'back');
+
+      // Pile + mound balls (everything still inside the bowl).
       for (const p of state.beforeParticles) {
+        if (p.leaked) continue;
         drawBall(ctx, p.x, p.y, p.r, COLORS.problem, p.alpha);
       }
 
-      drawFunnelOutline(ctx, f);
+      // Depth pass 2: side walls + FRONT arc of the rim + bottom ellipse.
+      // These remain in front of the pile.
+      drawFunnelOutline(ctx, f, 'front');
 
-      // Leaked particles drawn on top of the rim so the spill reads as outside the funnel
-      for (const p of state.leakedParticles) {
+      // Spilled balls outside the bowl — drawn last so they read as being in the foreground.
+      for (const p of state.beforeParticles) {
+        if (!p.leaked) continue;
         drawBall(ctx, p.x, p.y, p.r, COLORS.problem, p.alpha);
       }
       ctx.restore();
@@ -617,7 +734,6 @@ export default function FlowAnimation() {
       }
 
       updateBefore(layout, now);
-      updateLeaked(layout, now);
       updateAfter(layout, now);
 
       // Always draw background effects for visual consistency and "clarity"
@@ -629,31 +745,53 @@ export default function FlowAnimation() {
 
       ctx.restore();
 
+      // Capture-bound margins (kept as constants so the recording capture and the
+      // on-screen wireframe preview always use exactly the same area).
+      const CAPTURE_MARGIN_X = 110;
+      const CAPTURE_MARGIN_TOP = 180;
+      const CAPTURE_MARGIN_BOTTOM = 50;
+
       // Recording logic - high quality capture
       if (recordStateRef.current.isRecording) {
+        // 60fps render -> 24fps capture: only grab a frame every ~42ms.
+        // Use a "next deadline" scheme so we don't drift over a 12s recording.
+        if (now < recordStateRef.current.lastCaptureTime + CAPTURE_INTERVAL_MS) {
+          animationFrameId = requestAnimationFrame(render);
+          return;
+        }
+        recordStateRef.current.lastCaptureTime = now;
+
         const type = recordStateRef.current.recordingType;
         const bounds = type === 'left' ? layout.left : layout.right;
-        
-        // Use a 2x scale for capture to maintain "clarity" on high-res displays
-        const scale = 2; 
+
+        const captureX = bounds.x - CAPTURE_MARGIN_X;
+        const captureY = bounds.y - CAPTURE_MARGIN_TOP;
+        const captureW = bounds.width + CAPTURE_MARGIN_X * 2;
+        const captureH = bounds.height + CAPTURE_MARGIN_TOP + CAPTURE_MARGIN_BOTTOM;
+
+        // 2x scale capture for retina sharpness.
+        const scale = 2;
         const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = bounds.width * scale;
-        tempCanvas.height = bounds.height * scale;
+        tempCanvas.width = captureW * scale;
+        tempCanvas.height = captureH * scale;
         const tempCtx = tempCanvas.getContext('2d');
         if (tempCtx) {
-          // Draw the background color manually to ensure no transparency issues in GIF
           tempCtx.fillStyle = '#09090B';
           tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
-          
+
           tempCtx.drawImage(
-            canvas, 
-            (layout.sceneX + bounds.x) * DPR, (layout.sceneY + bounds.y) * DPR, 
-            bounds.width * DPR, bounds.height * DPR,
+            canvas,
+            (layout.sceneX + captureX) * DPR, (layout.sceneY + captureY) * DPR,
+            captureW * DPR, captureH * DPR,
             0, 0, tempCanvas.width, tempCanvas.height
           );
-          recordStateRef.current.frames.push(tempCanvas.toDataURL('image/jpeg', 0.9)); // JPEG is faster for large frames
+          // Lossless PNG data URI. At 288 frames raw RGBA would exhaust memory,
+          // so we store compressed PNG and decode back to RGBA during encoding.
+          recordStateRef.current.frames.push(tempCanvas.toDataURL('image/png'));
+          recordStateRef.current.gifWidth = tempCanvas.width;
+          recordStateRef.current.gifHeight = tempCanvas.height;
         }
-        
+
         recordStateRef.current.frameCount++;
         setProgress(Math.round((recordStateRef.current.frameCount / recordStateRef.current.maxFrames) * 100));
 
@@ -662,6 +800,25 @@ export default function FlowAnimation() {
         }
       }
 
+      // Wireframe preview for the export bounds. Drawn AFTER the recording's
+      // drawImage above so it never ends up inside the actual GIF — it's
+      // purely a visual guide for the user to see what each export captures.
+      const drawCaptureWireframe = (b: { x: number; y: number; width: number; height: number }) => {
+        const x = layout.sceneX + b.x - CAPTURE_MARGIN_X;
+        const y = layout.sceneY + b.y - CAPTURE_MARGIN_TOP;
+        const w = b.width + CAPTURE_MARGIN_X * 2;
+        const h = b.height + CAPTURE_MARGIN_TOP + CAPTURE_MARGIN_BOTTOM;
+        ctx.strokeRect(x, y, w, h);
+      };
+
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.28)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([8, 6]);
+      drawCaptureWireframe(layout.left);
+      drawCaptureWireframe(layout.right);
+      ctx.restore();
+
       animationFrameId = requestAnimationFrame(render);
     }
 
@@ -669,29 +826,70 @@ export default function FlowAnimation() {
       recordStateRef.current.isRecording = false;
       const type = recordStateRef.current.recordingType;
       const frames = recordStateRef.current.frames;
-      
-      const gifshot = (await import('gifshot')).default;
-      
-      gifshot.createGIF({
-        images: frames,
-        gifWidth: 760,  // Doubled resolution for clarity
-        gifHeight: 1040, // Doubled resolution for clarity
-        interval: 0.05,  // 20fps
-        numFrames: frames.length,
-        sampleInterval: 2, // Best quality/speed balance for color quantization
-        numWorkers: 4,     // Multi-core processing for high-res GIF
-      }, (obj: any) => {
-        if (!obj.error) {
-          const link = document.createElement('a');
-          link.href = obj.image;
-          link.download = `flow_${type}_ultra_hd.gif`;
-          link.click();
-        }
-        setIsExporting(null);
-        recordStateRef.current.frames = [];
-        recordStateRef.current.frameCount = 0;
-        setProgress(0);
-      });
+      const width = recordStateRef.current.gifWidth;
+      const height = recordStateRef.current.gifHeight;
+
+      // gifenc: modern GIF encoder with median-cut palette quantization in rgb565
+      // precision. Source frames are PNG (lossless) — we decode each one back to
+      // RGBA right before quantizing it, so the only quality loss is the GIF
+      // format's 256-color palette per frame.
+      const { GIFEncoder, quantize, applyPalette } = await import('gifenc');
+      const gif = GIFEncoder();
+
+      // Shared decode canvas — we reuse it across all frames to avoid thrashing.
+      const decodeCanvas = document.createElement('canvas');
+      decodeCanvas.width = width;
+      decodeCanvas.height = height;
+      const decodeCtx = decodeCanvas.getContext('2d', { willReadFrequently: true })!;
+
+      const frameDelay = Math.round(1000 / TARGET_FPS); // ~42 ms at 24fps
+
+      // Reset progress for the encoding phase so the user sees it tick up again.
+      setProgress(0);
+
+      for (let i = 0; i < frames.length; i++) {
+        // Decode the PNG data URI back to RGBA pixels.
+        const img = new Image();
+        img.src = frames[i];
+        await new Promise<void>((resolve, reject) => {
+          img.onload = () => resolve();
+          img.onerror = () => reject(new Error('frame decode failed'));
+        });
+        decodeCtx.clearRect(0, 0, width, height);
+        decodeCtx.drawImage(img, 0, 0);
+        const rgba = decodeCtx.getImageData(0, 0, width, height).data;
+
+        // Per-frame palette — best for animations whose color distribution shifts.
+        const palette = quantize(rgba, 256, { format: 'rgb565' });
+        const index = applyPalette(rgba, palette, 'rgb565');
+        gif.writeFrame(index, width, height, {
+          palette,
+          delay: frameDelay,
+        });
+
+        // Drop the PNG data we just consumed so memory doesn't pile up across 288 frames.
+        frames[i] = '';
+
+        setProgress(Math.round(((i + 1) / frames.length) * 100));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+
+      gif.finish();
+      const bytes = gif.bytes();
+      const blob = new Blob([bytes as BlobPart], { type: 'image/gif' });
+      const url = URL.createObjectURL(blob);
+
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `flow_${type}_24fps.gif`;
+      link.click();
+
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+
+      setIsExporting(null);
+      recordStateRef.current.frames = [];
+      recordStateRef.current.frameCount = 0;
+      setProgress(0);
     }
 
     (window as any).startExport = (type: 'left' | 'right') => {
@@ -699,6 +897,7 @@ export default function FlowAnimation() {
       recordStateRef.current.recordingType = type;
       recordStateRef.current.frames = [];
       recordStateRef.current.frameCount = 0;
+      recordStateRef.current.lastCaptureTime = 0; // capture the very next frame
       recordStateRef.current.isRecording = true;
     };
 
